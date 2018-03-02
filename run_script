@@ -1,0 +1,16 @@
+#!/bin/bash
+
+
+
+while [ 1 ]
+do
+	#for tbl in $(cat /dev/us-015)
+	#do
+		#echo "$tbl"
+	#done
+
+	echo $(cat /dev/us-015)
+
+	sleep .5
+
+done
