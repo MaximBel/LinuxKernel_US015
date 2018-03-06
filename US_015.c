@@ -1,84 +1,71 @@
-/*
- * Linux 2.6 and later 'parrot' sample device driver
- *
- * Copyright (c) 2011-2015, Pete Batard <pete@akeo.ie>
- *
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/slab.h>
+//#include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/device.h>
 #include <linux/types.h>
-#include <linux/mutex.h>
 #include <linux/kthread.h>
-#include <linux/interrupt.h>  // Required for the IRQ code
+#include <linux/interrupt.h>
 #include <linux/gpio.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
+#include <asm/uaccess.h>
+#include <linux/timekeeping.h>
+#include <asm/div64.h>
 
-#define DEVICE_NAME	"us-015"
-#define DEVICE_CLASS "ultrasonic sensor"
+#define DEVICE_NAME					"us-015"
+#define DEVICE_CLASS 				"Ultrasonic sensor"
+#define OUTPUT_MESSAGE_MAX_LENGTH 	7
 
-static int majorNumber;
-static short size_of_message;
+
+//-----------------
 static struct class* us_Class = NULL;
 static struct device* us_Device = NULL;
-static int irqNumber;                  // used to share the IRQ number
-
-//static task_struct *immortalTask;
-
+static int majorNumber;
+//-----------------
+static struct task_struct * usThread = NULL;
+static int irqNumber;
+//-----------------
+static char outputMessage[OUTPUT_MESSAGE_MAX_LENGTH];
+static unsigned int readOffset = 0;
+static unsigned int lengthOfData = 0;
+static unsigned int distance_in_sm = 999;
+static bool echoPinTriggered = false;
+static u64 echoPinTrigOnTime = 0;
+//-------PARAMS-------------
 static unsigned int trigPin = 5;
 static unsigned int echoPin = 6;
-
-/* Module parameters that can be provided on insmod */
+//-----
 module_param( trigPin, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(trigPin, "Pin to make ultrasonic signal.");
-
+//-----
 module_param( echoPin, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(echoPin, "Pin to check ultrasonic responce.");
 
 static inline int __init gpio_init(void);
-
 static inline void __exit gpio_deinit(void);
-
 static irq_handler_t gpio_us_echo_handler(unsigned int irq, void *dev_id, struct pt_regs *regs);
-
 static int us_Task(void* Params);
 
-
-
-// The prototype functions for the character driver -- must come before the struct definition
+// File operation functions for /dev fs
 static int dev_open(struct inode *, struct file *);
 static int dev_release(struct inode *, struct file *);
 static ssize_t dev_read(struct file *, char *, size_t, loff_t *);
 static ssize_t dev_write(struct file *, const char *, size_t, loff_t *);
 
+static struct file_operations fops = {
+		.open = dev_open,
+		.read = dev_read,
+		.write = dev_write,
+		.release = dev_release
+};
 
 
-/** @brief Devices are represented as file structure in the kernel. The file_operations structure from
- *  /linux/fs.h lists the callback functions that you wish to associated with your file operations
- *  using a C99 syntax structure. char devices usually implement open, read, write and release calls
- */
-static struct file_operations fops = { .open = dev_open, .read = dev_read,
-		.write = dev_write, .release = dev_release, };
-
-/* Module initialization and release */
 static int __init us_init(void)
 {
+
+	//------gpio init-------------
 
 	int gpioInitState = gpio_init();
 
@@ -86,82 +73,96 @@ static int __init us_init(void)
 			gpioInitState == EINVAL ||
 			gpioInitState == ENOSPC) {
 
-		printk(KERN_ALERT "US-015: Gpio init fail with code %d \r\n", gpioInitState);
-
+		printk(KERN_ALERT "US-015: Gpio init fail with code %d.\r\n", gpioInitState);
 		gpio_deinit();
-
 		return -gpioInitState;
 
 	}
 
-	// Try to dynamically allocate a major number for the device -- more difficult but worth it
+	//---------thread init-----------------
+
+	usThread = kthread_run(us_Task, NULL, "US-015 thread");
+
+	if(!usThread || usThread == ERR_PTR(-ENOMEM)) {
+	 printk(KERN_ALERT "US-015: Thread init fail. \r\n");
+	 gpio_deinit();
+	 return -usThread;
+	 }
+	printk(KERN_ALERT "US-015: thread was started.\r\n");
+
+	//---------Char. device init------------
+
 	majorNumber = register_chrdev(0, DEVICE_NAME, &fops);
 	if (majorNumber<0) {
 		printk(KERN_ALERT "Failed to register a major number of US-015\n");
 		return majorNumber;
 	}
 
-	// Register the device class
 	us_Class = class_create(THIS_MODULE, DEVICE_CLASS);
-
-	if (IS_ERR(us_Class)) { // Check for error and clean up if there is
+	if (IS_ERR(us_Class)) {
 		unregister_chrdev(majorNumber, DEVICE_NAME);
 		printk(KERN_ALERT "Failed to register device class\n");
-		return PTR_ERR(us_Class);// Correct way to return an error on a pointer
+		return PTR_ERR(us_Class);
 	}
 
-	// Register the device driver
 	us_Device = device_create(us_Class, NULL, MKDEV(majorNumber, 0), NULL, DEVICE_NAME);
-
-	if (IS_ERR(us_Device)) {           // Clean up if there is an error
-		class_destroy(us_Class);// Repeated code but the alternative is goto statements
+	if (IS_ERR(us_Device)) {
+		class_destroy(us_Class);
 		unregister_chrdev(majorNumber, DEVICE_NAME);
 		printk(KERN_ALERT "Failed to create the device\n");
 		return PTR_ERR(us_Device);
 	}
 
-	printk(KERN_INFO "US-015: module complitely initialized\n");
+	printk(KERN_INFO "US-015: device initialized, module complitely loaded!\r\n");
 
 	return 0;
 }
 
 static void __exit us_exit(void)
 {
-	device_destroy(us_Class, MKDEV(majorNumber, 0));     // remove the device
-	class_unregister(us_Class);// unregister the device class
-	class_destroy(us_Class);// remove the device class
-	unregister_chrdev(majorNumber, DEVICE_NAME);// unregister the major number
+	int unregResult = -1;
+
+	//----------------------
+	device_destroy(us_Class, MKDEV(majorNumber, 0));
+	class_unregister(us_Class);
+	class_destroy(us_Class);
+	unregister_chrdev(majorNumber, DEVICE_NAME);
+	printk(KERN_INFO "US-015: device released.\r\n");
+	//-----------------------
 
 	gpio_deinit();
 
-	printk(KERN_INFO "US-015: module complitely removed\n");
+	//----------------------
+	if(usThread) {
+		unregResult = kthread_stop(usThread);
+		printk(KERN_INFO "US-015: thread removed with state: %d\r\n", unregResult);
+	}
+
+	printk(KERN_INFO "US-015: module complitely removed\r\n");
 }
 
 static inline int __init gpio_init(void) {
 	unsigned long IRQflags;
 	int result;
 
+	//----export trig
 	gpio_request(trigPin, "sysfs");
-	gpio_direction_output(trigPin, 0);// set in output mode
-	gpio_export(trigPin, false);// appears in /sys/class/gpio/
+	gpio_direction_output(trigPin, 0);
+	gpio_export(trigPin, false);
+	gpio_set_value(trigPin, 0);
 	printk(KERN_INFO "US-015: gpio %d exported\n", trigPin);
 
-	gpio_request(echoPin, "sysfs");// set up the gpioButton
-	gpio_direction_input(echoPin);// set up as an input
-	gpio_set_debounce(echoPin, 50);// ddebounce the button 50ms
-	gpio_export(echoPin, false);// appears in /sys/class/gpio/
+	//----export echo
+	gpio_request(echoPin, "sysfs");
+	gpio_direction_input(echoPin);
+	gpio_set_debounce(echoPin, 50);
+	gpio_export(echoPin, false);
 	printk(KERN_INFO "US-015: gpio %d exported\n", echoPin);
 
+	//---register interrupt
 	irqNumber = gpio_to_irq(echoPin);
-
-	IRQflags = IRQF_TRIGGER_RISING;
-
-	// This next call requests an interrupt line
-	result = request_irq(irqNumber,// the interrupt number
-			(irq_handler_t) gpio_us_echo_handler,
-			IRQflags,// use custom kernel param
-			"us-015_handler",// used in /proc/interrupts
-			NULL);// the *dev_id for shared lines
+	IRQflags = IRQF_TRIGGER_FALLING;
+	result = request_irq(irqNumber,	(irq_handler_t) gpio_us_echo_handler, IRQflags, "us-015_handler", NULL);
 
 	return result;
 
@@ -169,78 +170,133 @@ static inline int __init gpio_init(void) {
 
 static inline void __exit gpio_deinit(void) {
 
-	free_irq(irqNumber, NULL);// free the IRQ number, no *dev_id required in this case
-	gpio_unexport(echoPin);// unexport the Button GPIO
-	gpio_free(echoPin);// free the LED GPIO
+	//----unexport echo interrupt and actualy echo pin
+	free_irq(irqNumber, NULL);
+	gpio_unexport(echoPin);
+	gpio_free(echoPin);
 
-	gpio_set_value(trigPin, 0);      // turn the LED off, device was unloaded
-	gpio_unexport(trigPin);// unexport the LED GPIO
-	gpio_free(trigPin);// free the Button GPIO
+	//---
+	gpio_set_value(trigPin, 0);
+	gpio_unexport(trigPin);
+	gpio_free(trigPin);
 
 	printk(KERN_INFO "US-015: gpio %d and %d unexported\n", trigPin, echoPin);
 
 }
 
-static irq_handler_t gpio_us_echo_handler(unsigned int irq, void *dev_id, struct pt_regs *regs){
+static irq_handler_t gpio_us_echo_handler(unsigned int irq, void *dev_id, struct pt_regs *regs) {
 
-	printk(KERN_INFO "US-015: Echo pin triggered\r\n");
+	// ----processing echo pin interrupt
+	if(echoPinTriggered == false) {
+		echoPinTrigOnTime = ktime_get_ns();
+		echoPinTriggered = true;
+	}
 
-	return (irq_handler_t) IRQ_HANDLED;  // announce IRQ was handled correctly
+	return (irq_handler_t) IRQ_HANDLED;
 
 }
 
 static int us_Task(void* Params) {
 
+	u64 measurementStart = 0;
+
+	while (!kthread_should_stop()) {
+
+		echoPinTriggered = false;
+
+		// trig pin to start measurement
+		gpio_set_value(trigPin, 1);
+		udelay(10);
+		gpio_set_value(trigPin, 0);
+
+		// wait for HIGH level on echo pin
+		while(gpio_get_value(echoPin) == 0);
+
+		// registrate measurement start
+		measurementStart = ktime_get_ns();
+		// specific division for 64-bit number
+		do_div(measurementStart, 1000);
+
+		// wait for reflation from barier
+		msleep(50);
+
+		// if interrupt was triggered
+		if(echoPinTriggered == true) {
+
+			// specific division for 64-bit number
+			do_div(echoPinTrigOnTime, 1000);
+			// calc distance for object(in santimeters)
+			distance_in_sm = ((int)(echoPinTrigOnTime - measurementStart) * 34029) / 4000000 ;
+
+		} else {
+
+			// else we have infinity distance
+			distance_in_sm = 999;
+
+		}
+
+	}
+
+	return 0;
 
 }
 
 static int dev_open(struct inode *inodep, struct file *filep) {
 
-// nothing to do here
-printk(KERN_INFO "US-015: Device opened\r\n");
+	printk(KERN_INFO "US-015: Device opened\r\n");
 
-return 0;
+	sprintf(outputMessage, "%03u\r\n", distance_in_sm);
+	lengthOfData = strlen(outputMessage);
+	readOffset = 0;
+
+	return 0;
 }
 
-static ssize_t dev_read(struct file *filep, char *buffer, size_t len,
-	loff_t *offset) {
-int error_count = 0;
-// copy_to_user has the format ( * to, *from, size) and returns 0 on success
-//error_count = copy_to_user(buffer, message, size_of_message); //TODO: do this function
+static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *offset) {
+	int error_count = 1;
+	int outputLength = 0;
 
-printk(KERN_INFO "US-015: Nothing to read from LKM\r\n");
+	outputLength = len < (lengthOfData - readOffset) ? len : (lengthOfData - readOffset);
 
-if (error_count == 0) {            // if true then have success
-	printk(KERN_INFO "US-015: Sent distance to the user\n");
-	return (size_of_message = 0); // clear the position to the start and return 0
-} else {
-	printk(KERN_INFO "US-015: Failed to send data to the user\n");
-	return -EFAULT;         // Failed -- return a bad address message (i.e. -14)
+	// copy_to_user has the format ( * to, *from, size) and returns 0 on success
+	error_count = copy_to_user(buffer, &outputMessage[readOffset], outputLength);
+
+	if (error_count == 0) {
+
+		printk(KERN_INFO "US-015: Distance was sended to user.\n");
+		readOffset += outputLength;
+		return outputLength;
+
+	} else {
+
+		printk(KERN_INFO "US-015: Fail to write data to user\r\n");
+		return -EFAULT;
+
+	}
+
 }
-}
 
-static ssize_t dev_write(struct file *filep, const char *buffer, size_t len,
-	loff_t *offset) {
+static ssize_t dev_write(struct file *filep, const char *buffer, size_t len, loff_t *offset) {
 
-printk(KERN_INFO "US-015: Nothing to write from user\r\n");
+	printk(KERN_INFO "US-015: Nothing to write from user\r\n");
 
-return 0;
+	return 0;
 }
 
 static int dev_release(struct inode *inodep, struct file *filep) {
 
 // nothing to do here
-printk(KERN_INFO "US-015: Device released\r\n");
+	printk(KERN_INFO "US-015: Device released\r\n");
 
-return 0;
+	return 0;
 }
 
-/* Let the kernel know the calls for module init and exit */
+
 module_init( us_init);
 module_exit( us_exit);
 
 /* Module information */
 MODULE_AUTHOR("Beley Maxim");
 MODULE_DESCRIPTION("Driver for US-015 ultrasonic distance sensor");
-MODULE_VERSION("0.1");
-MODULE_LICENSE("GPL");
+MODULE_VERSION("1.1");
+MODULE_LICENSE("GPLv3");
