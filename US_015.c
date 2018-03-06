@@ -86,7 +86,7 @@ static int __init us_init(void)
 	if(!usThread || usThread == ERR_PTR(-ENOMEM)) {
 	 printk(KERN_ALERT "US-015: Thread init fail. \r\n");
 	 gpio_deinit();
-	 return -usThread;
+	 return -((int)usThread);
 	 }
 	printk(KERN_ALERT "US-015: thread was started.\r\n");
 
@@ -299,4 +299,4 @@ module_exit( us_exit);
 MODULE_AUTHOR("Beley Maxim");
 MODULE_DESCRIPTION("Driver for US-015 ultrasonic distance sensor");
 MODULE_VERSION("1.1");
-MODULE_LICENSE("GPLv3");
+MODULE_LICENSE("GPL");
